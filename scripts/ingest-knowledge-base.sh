@@ -139,8 +139,19 @@ VS_NAME="${VS_NAME:-techx-db}"
 
 echo ""
 echo "--- Embedding Models ---"
-AVAILABLE_EMBEDDINGS=$(echo "$ALL_MODELS" \
+
+# Find models with model_type "embedding"
+TYPE_EMBEDDINGS=$(echo "$ALL_MODELS" \
   | jq -r '.data[] | select(.model_type == "embedding") | .identifier' 2>/dev/null)
+
+# Also find models with "embedding" or "embed" in the name (some providers
+# register Gemini/OpenAI embedding models as model_type "llm")
+NAME_EMBEDDINGS=$(echo "$ALL_MODELS" \
+  | jq -r '.data[] | select(.identifier | test("embed"; "i")) | .identifier' 2>/dev/null)
+
+# Merge and deduplicate
+AVAILABLE_EMBEDDINGS=$(printf '%s\n%s' "$TYPE_EMBEDDINGS" "$NAME_EMBEDDINGS" \
+  | sort -u | sed '/^$/d')
 
 if [ -n "$AVAILABLE_EMBEDDINGS" ]; then
   EMBED_COUNT=$(echo "$AVAILABLE_EMBEDDINGS" | wc -l | tr -d ' ')
@@ -148,9 +159,22 @@ if [ -n "$AVAILABLE_EMBEDDINGS" ]; then
   INDEX=0
   while IFS= read -r model; do
     INDEX=$((INDEX + 1))
-    echo "  ${INDEX}) ${model}"
+    # Tag models that likely need HuggingFace
+    if echo "$model" | grep -qi "sentence-transformers"; then
+      echo "  ${INDEX}) ${model}  [local - needs HuggingFace]"
+    else
+      echo "  ${INDEX}) ${model}"
+    fi
   done <<< "$AVAILABLE_EMBEDDINGS"
-  DEFAULT_EMBEDDING=$(echo "$AVAILABLE_EMBEDDINGS" | head -1)
+
+  # Prefer models registered with model_type "embedding" (properly configured
+  # for vector store use). Name-matched models may exist but might not be
+  # wired to the vector_io provider.
+  if [ -n "$TYPE_EMBEDDINGS" ]; then
+    DEFAULT_EMBEDDING=$(echo "$TYPE_EMBEDDINGS" | head -1)
+  else
+    DEFAULT_EMBEDDING=$(echo "$AVAILABLE_EMBEDDINGS" | head -1)
+  fi
 else
   echo "  (Could not fetch embedding models — enter the model name manually)"
   DEFAULT_EMBEDDING=""
@@ -351,6 +375,70 @@ if [ "$VECTOR_STORE_ID" == "null" ] || [ -z "$VECTOR_STORE_ID" ]; then
 fi
 
 echo "Created vector store: ${VECTOR_STORE_ID} (status: ${VS_STATUS})"
+echo ""
+
+# =============================================================================
+# Canary test — verify embedding model can actually process a file
+# =============================================================================
+
+echo "--- Verifying embedding model works ---"
+CANARY_FILE=$(mktemp /tmp/canary-XXXXXX.md)
+echo "# Canary Test Document" > "$CANARY_FILE"
+echo "This is a test document to verify the embedding model is operational." >> "$CANARY_FILE"
+
+# Upload canary file
+CANARY_UPLOAD=$(curl -sk -X POST "${LLAMA_STACK_URL}/v1/openai/v1/files" \
+  -F "file=@${CANARY_FILE}" \
+  -F "purpose=assistants" 2>/dev/null)
+CANARY_FILE_ID=$(echo "$CANARY_UPLOAD" | jq -r '.id' 2>/dev/null)
+rm -f "$CANARY_FILE"
+
+if [ "$CANARY_FILE_ID" == "null" ] || [ -z "$CANARY_FILE_ID" ]; then
+  echo "WARNING: Could not upload canary file. Proceeding anyway..."
+else
+  # Try to ingest the canary file
+  CANARY_INGEST=$(curl -sk -X POST "${LLAMA_STACK_URL}/v1/openai/v1/vector_stores/${VECTOR_STORE_ID}/files" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"file_id\": \"${CANARY_FILE_ID}\",
+      \"chunking_strategy\": {\"type\": \"auto\"}
+    }" 2>/dev/null)
+
+  CANARY_STATUS=$(echo "$CANARY_INGEST" | jq -r '.status' 2>/dev/null)
+  CANARY_ERROR=$(echo "$CANARY_INGEST" | jq -r '.last_error // empty' 2>/dev/null)
+
+  if [ "$CANARY_STATUS" == "completed" ]; then
+    echo "OK — embedding model is working"
+    # Clean up canary file from vector store
+    curl -sk -X DELETE "${LLAMA_STACK_URL}/v1/openai/v1/vector_stores/${VECTOR_STORE_ID}/files/${CANARY_FILE_ID}" > /dev/null 2>&1
+    curl -sk -X DELETE "${LLAMA_STACK_URL}/v1/openai/v1/files/${CANARY_FILE_ID}" > /dev/null 2>&1
+  else
+    echo ""
+    echo "ERROR: Embedding model failed to process a test file!"
+    echo ""
+    if echo "$CANARY_ERROR" | grep -qi "huggingface"; then
+      echo "  Root cause: The server cannot download the embedding model from HuggingFace."
+      echo ""
+      echo "  This means the Llama Stack server does not have internet access to"
+      echo "  download model weights. To fix this:"
+      echo ""
+      echo "  Option 1: Enable internet access on the Llama Stack server"
+      echo "  Option 2: Pre-cache the model on the server:"
+      echo "    ssh into the server and run:"
+      echo "      pip install sentence-transformers"
+      echo "      python -c \"from sentence_transformers import SentenceTransformer; SentenceTransformer('${EMBEDDING_MODEL}')\""
+      echo "  Option 3: Use a different embedding model that is already cached"
+    else
+      echo "  Server error: $(echo "$CANARY_ERROR" | jq . 2>/dev/null || echo "$CANARY_ERROR")"
+    fi
+    echo ""
+    # Clean up: delete the vector store we just created
+    curl -sk -X DELETE "${LLAMA_STACK_URL}/v1/openai/v1/files/${CANARY_FILE_ID}" > /dev/null 2>&1
+    curl -sk -X DELETE "${LLAMA_STACK_URL}/v1/openai/v1/vector_stores/${VECTOR_STORE_ID}" > /dev/null 2>&1
+    echo "  Cleaned up vector store ${VECTOR_STORE_ID}."
+    exit 1
+  fi
+fi
 echo ""
 
 # =============================================================================
