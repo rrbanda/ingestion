@@ -25,7 +25,9 @@ else
   KB_DIR="${WORKSPACE_DIR}/docs/knowledge-base"
 fi
 
-# --- Preflight checks ---
+# =============================================================================
+# Preflight checks
+# =============================================================================
 
 for cmd in curl jq; do
   if ! command -v "$cmd" &> /dev/null; then
@@ -54,7 +56,7 @@ echo "Found ${MD_COUNT} markdown file(s) in ${KB_DIR}"
 echo ""
 
 # =============================================================================
-# Prompt for configuration
+# Prompt: Llama Stack URL
 # =============================================================================
 
 read -p "Llama Stack URL (e.g. https://my-llama-stack.example.com): " LLAMA_STACK_URL
@@ -65,22 +67,53 @@ fi
 # Strip trailing slash
 LLAMA_STACK_URL="${LLAMA_STACK_URL%/}"
 
+# Quick connectivity check before continuing
+echo ""
+echo "Checking connectivity..."
+HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" --connect-timeout 10 "${LLAMA_STACK_URL}/v1/openai/v1/vector_stores" 2>/dev/null)
+if [ "$HTTP_CODE" != "200" ]; then
+  echo "ERROR: Cannot reach Llama Stack at ${LLAMA_STACK_URL} (HTTP ${HTTP_CODE})"
+  echo "       Check the URL and ensure the server is running."
+  exit 1
+fi
+echo "OK — Llama Stack is reachable"
+
+# =============================================================================
+# Fetch all models once (reuse for embedding + LLM sections)
+# =============================================================================
+
+echo ""
+echo "Fetching available models from Llama Stack..."
+ALL_MODELS=$(curl -sk "${LLAMA_STACK_URL}/v1/models" 2>/dev/null)
+
+# =============================================================================
+# Prompt: Vector Store Name
+# =============================================================================
+
+echo ""
 read -p "Vector Store Name [techx-db]: " VS_NAME
 VS_NAME="${VS_NAME:-techx-db}"
 
-# --- Fetch and display available embedding models ---
+# =============================================================================
+# Prompt: Embedding Model (auto-discovered)
+# =============================================================================
 
 echo ""
-echo "Fetching available embedding models from Llama Stack..."
-AVAILABLE_EMBEDDINGS=$(curl -sk "${LLAMA_STACK_URL}/v1/models" \
+echo "--- Embedding Models ---"
+AVAILABLE_EMBEDDINGS=$(echo "$ALL_MODELS" \
   | jq -r '.data[] | select(.model_type == "embedding") | .identifier' 2>/dev/null)
 
 if [ -n "$AVAILABLE_EMBEDDINGS" ]; then
-  echo "Available embedding models:"
-  echo "$AVAILABLE_EMBEDDINGS" | while read -r model; do echo "  - ${model}"; done
+  EMBED_COUNT=$(echo "$AVAILABLE_EMBEDDINGS" | wc -l | tr -d ' ')
+  echo "Found ${EMBED_COUNT} embedding model(s):"
+  INDEX=0
+  while IFS= read -r model; do
+    INDEX=$((INDEX + 1))
+    echo "  ${INDEX}) ${model}"
+  done <<< "$AVAILABLE_EMBEDDINGS"
   DEFAULT_EMBEDDING=$(echo "$AVAILABLE_EMBEDDINGS" | head -1)
 else
-  echo "  (Could not fetch models — enter the model name manually)"
+  echo "  (Could not fetch embedding models — enter the model name manually)"
   DEFAULT_EMBEDDING=""
 fi
 echo ""
@@ -96,35 +129,89 @@ else
   fi
 fi
 
-read -p "Embedding Dimension [768]: " EMBEDDING_DIM
-EMBEDDING_DIM="${EMBEDDING_DIM:-768}"
+# --- Auto-detect embedding dimension ---
+# Try to get dimension from model metadata; fall back to common defaults
+AUTO_DIM=$(echo "$ALL_MODELS" \
+  | jq -r ".data[] | select(.identifier == \"${EMBEDDING_MODEL}\") | .metadata.embedding_dimension // empty" 2>/dev/null)
 
-# --- Fetch and display available LLM models for RAG test ---
+if [ -n "$AUTO_DIM" ] && [ "$AUTO_DIM" != "null" ]; then
+  echo "  Auto-detected embedding dimension: ${AUTO_DIM}"
+  DEFAULT_DIM="$AUTO_DIM"
+else
+  # Guess based on well-known model names
+  case "$EMBEDDING_MODEL" in
+    *all-MiniLM-L6*)       DEFAULT_DIM=384 ;;
+    *nomic-embed*)          DEFAULT_DIM=768 ;;
+    *bge-large*|*e5-large*) DEFAULT_DIM=1024 ;;
+    *text-embedding-3-small*) DEFAULT_DIM=1536 ;;
+    *text-embedding-3-large*) DEFAULT_DIM=3072 ;;
+    *text-embedding-004*)   DEFAULT_DIM=768 ;;
+    *gemini-embedding*)     DEFAULT_DIM=768 ;;
+    *)                      DEFAULT_DIM=768 ;;
+  esac
+  echo "  Estimated embedding dimension for '${EMBEDDING_MODEL}': ${DEFAULT_DIM}"
+  echo "  (Common values: 384, 768, 1024, 1536, 3072)"
+fi
+
+read -p "Embedding Dimension [${DEFAULT_DIM}]: " EMBEDDING_DIM
+EMBEDDING_DIM="${EMBEDDING_DIM:-${DEFAULT_DIM}}"
+
+# Validate dimension is a number
+if ! [[ "$EMBEDDING_DIM" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: Embedding dimension must be a number, got: ${EMBEDDING_DIM}"
+  exit 1
+fi
+
+# =============================================================================
+# Prompt: LLM Model for RAG test (auto-discovered, filtered)
+# =============================================================================
 
 echo ""
-echo "Fetching available LLM models for RAG test..."
-AVAILABLE_LLMS=$(curl -sk "${LLAMA_STACK_URL}/v1/models" \
-  | jq -r '.data[] | select(.model_type == "llm") | .identifier' 2>/dev/null)
+echo "--- LLM Models (for optional RAG test) ---"
+
+# Filter to only chat/completion-capable LLM models
+# Exclude: embedding, imagen, veo, lyria, tts, aqa, robotics models
+AVAILABLE_LLMS=$(echo "$ALL_MODELS" \
+  | jq -r '.data[] | select(.model_type == "llm") | .identifier' 2>/dev/null \
+  | grep -iv -e 'embedding' -e 'imagen' -e 'veo' -e 'lyria' -e 'tts' -e 'aqa' -e 'robotics' -e 'image-generation' -e 'nano-banana' -e 'deep-research')
 
 if [ -n "$AVAILABLE_LLMS" ]; then
-  echo "Available LLM models:"
-  echo "$AVAILABLE_LLMS" | while read -r model; do echo "  - ${model}"; done
-  DEFAULT_LLM=$(echo "$AVAILABLE_LLMS" | head -1)
+  LLM_COUNT=$(echo "$AVAILABLE_LLMS" | wc -l | tr -d ' ')
+  echo "Found ${LLM_COUNT} chat-capable LLM(s):"
+  INDEX=0
+  while IFS= read -r model; do
+    INDEX=$((INDEX + 1))
+    echo "  ${INDEX}) ${model}"
+  done <<< "$AVAILABLE_LLMS"
+
+  # Pick a sensible default: prefer gemini-2.5-flash, then any gemini, then first
+  DEFAULT_LLM=$(echo "$AVAILABLE_LLMS" | grep -m1 'gemini-2.5-flash$' 2>/dev/null || \
+                echo "$AVAILABLE_LLMS" | grep -m1 'gemini' 2>/dev/null || \
+                echo "$AVAILABLE_LLMS" | head -1)
 else
-  echo "  (Could not fetch models — enter the model name manually)"
+  echo "  (Could not fetch LLM models — enter the model name manually, or press Enter to skip)"
   DEFAULT_LLM=""
 fi
 echo ""
 
 if [ -n "$DEFAULT_LLM" ]; then
-  read -p "LLM Model for RAG test [${DEFAULT_LLM}]: " LLM_MODEL
-  LLM_MODEL="${LLM_MODEL:-${DEFAULT_LLM}}"
+  read -p "LLM Model for RAG test [${DEFAULT_LLM}] (Enter to accept, 'skip' to skip): " LLM_MODEL
+  if [ "$LLM_MODEL" == "skip" ]; then
+    LLM_MODEL=""
+    echo "  Skipping RAG test."
+  else
+    LLM_MODEL="${LLM_MODEL:-${DEFAULT_LLM}}"
+  fi
 else
-  read -p "LLM Model for RAG test: " LLM_MODEL
+  read -p "LLM Model for RAG test (press Enter to skip): " LLM_MODEL
   if [ -z "$LLM_MODEL" ]; then
-    echo "WARNING: No LLM model specified — skipping RAG test."
+    echo "  Skipping RAG test."
   fi
 fi
+
+# =============================================================================
+# Configuration Summary + Confirmation
+# =============================================================================
 
 echo ""
 echo "----------------------------------------------"
@@ -145,19 +232,6 @@ if [[ ! "$CONFIRM_PROCEED" =~ ^[Yy]$ ]]; then
   echo "Aborted."
   exit 0
 fi
-echo ""
-
-# =============================================================================
-# Check connectivity
-# =============================================================================
-
-echo "--- Checking Llama Stack connectivity ---"
-HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" "${LLAMA_STACK_URL}/v1/openai/v1/vector_stores")
-if [ "$HTTP_CODE" != "200" ]; then
-  echo "ERROR: Cannot reach Llama Stack at ${LLAMA_STACK_URL} (HTTP ${HTTP_CODE})"
-  exit 1
-fi
-echo "OK — Llama Stack is reachable"
 echo ""
 
 # =============================================================================
@@ -221,8 +295,19 @@ VECTOR_STORE_ID=$(echo "$CREATE_RESPONSE" | jq -r '.id')
 VS_STATUS=$(echo "$CREATE_RESPONSE" | jq -r '.status')
 
 if [ "$VECTOR_STORE_ID" == "null" ] || [ -z "$VECTOR_STORE_ID" ]; then
-  echo "ERROR: Failed to create vector store"
-  echo "$CREATE_RESPONSE" | jq .
+  echo "ERROR: Failed to create vector store."
+  echo ""
+  ERROR_DETAIL=$(echo "$CREATE_RESPONSE" | jq -r '.detail // empty' 2>/dev/null)
+  if [ -n "$ERROR_DETAIL" ]; then
+    echo "  Server said: ${ERROR_DETAIL}"
+  else
+    echo "  Response: $(echo "$CREATE_RESPONSE" | jq . 2>/dev/null)"
+  fi
+  echo ""
+  echo "Troubleshooting:"
+  echo "  - Is the embedding model '${EMBEDDING_MODEL}' registered on this server?"
+  echo "  - Is dimension ${EMBEDDING_DIM} correct for this model?"
+  echo "  - Run: curl -sk ${LLAMA_STACK_URL}/v1/models | jq '.data[] | select(.model_type==\"embedding\")'"
   exit 1
 fi
 
@@ -246,7 +331,7 @@ for FILE_PATH in "${KB_DIR}"/*.md; do
   FILENAME=$(basename "$FILE_PATH")
   FILE_COUNT=$((FILE_COUNT + 1))
 
-  echo "[${FILE_COUNT}] Uploading: ${FILENAME}"
+  echo "[${FILE_COUNT}/${MD_COUNT}] Uploading: ${FILENAME}"
 
   # Step 1: Upload file
   UPLOAD_RESPONSE=$(curl -sk -X POST "${LLAMA_STACK_URL}/v1/openai/v1/files" \
@@ -258,7 +343,7 @@ for FILE_PATH in "${KB_DIR}"/*.md; do
 
   if [ "$FILE_ID" == "null" ] || [ -z "$FILE_ID" ]; then
     echo "    ERROR: Upload failed"
-    echo "    $UPLOAD_RESPONSE"
+    echo "    $(echo "$UPLOAD_RESPONSE" | jq -r '.detail // .' 2>/dev/null)"
     FAIL_COUNT=$((FAIL_COUNT + 1))
     continue
   fi
@@ -286,8 +371,8 @@ for FILE_PATH in "${KB_DIR}"/*.md; do
     echo "    Ingested: OK"
     SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
   else
-    echo "    ERROR: Ingestion failed (status: ${ATTACH_STATUS})"
-    echo "    $(echo "$ATTACH_RESPONSE" | jq -r '.last_error // empty')"
+    echo "    WARNING: Ingestion status: ${ATTACH_STATUS}"
+    echo "    $(echo "$ATTACH_RESPONSE" | jq -r '.last_error // empty' 2>/dev/null)"
     FAIL_COUNT=$((FAIL_COUNT + 1))
   fi
 
@@ -305,7 +390,7 @@ echo "$FINAL_STATUS"
 echo ""
 
 # =============================================================================
-# Test RAG search (optional)
+# Test RAG search (optional, non-fatal)
 # =============================================================================
 
 if [ -n "$LLM_MODEL" ]; then
@@ -315,6 +400,8 @@ if [ -n "$LLM_MODEL" ]; then
   echo "Query: ${TEST_QUERY}"
   echo ""
 
+  # Disable set -e for the RAG test so a failure doesn't kill the script
+  set +e
   TEST_RESPONSE=$(curl -sk -X POST "${LLAMA_STACK_URL}/v1/openai/v1/responses" \
     -H "Content-Type: application/json" \
     -d "{
@@ -322,18 +409,33 @@ if [ -n "$LLM_MODEL" ]; then
       \"input\": \"${TEST_QUERY}\",
       \"tools\": [{\"type\": \"file_search\", \"vector_store_ids\": [\"${VECTOR_STORE_ID}\"]}],
       \"include\": [\"file_search_call.results\"]
-    }")
+    }" 2>/dev/null)
+  CURL_RC=$?
+  set -e
 
-  ANSWER=$(echo "$TEST_RESPONSE" | jq -r '.output[] | select(.type == "message") | .content[] | .text')
-
-  if [ -n "$ANSWER" ] && [ "$ANSWER" != "null" ]; then
-    echo "RAG Response:"
-    echo "$ANSWER"
-    echo ""
-    echo "RAG search is working."
+  if [ $CURL_RC -ne 0 ]; then
+    echo "WARNING: RAG test request failed (curl exit code: ${CURL_RC})."
+    echo "         Ingestion was successful — test the RAG search manually."
   else
-    echo "WARNING: RAG search returned no answer."
-    echo "$TEST_RESPONSE" | jq '.error // .output' 2>/dev/null
+    # Check for API-level error
+    API_ERROR=$(echo "$TEST_RESPONSE" | jq -r '.detail // .error // empty' 2>/dev/null)
+    if [ -n "$API_ERROR" ] && [ "$API_ERROR" != "null" ]; then
+      echo "WARNING: RAG test returned an error: ${API_ERROR}"
+      echo "         The LLM model '${LLM_MODEL}' may not support tool use."
+      echo "         Ingestion was successful — try a different model for RAG queries."
+    else
+      ANSWER=$(echo "$TEST_RESPONSE" | jq -r '.output[]? | select(.type == "message") | .content[]? | .text' 2>/dev/null)
+
+      if [ -n "$ANSWER" ] && [ "$ANSWER" != "null" ]; then
+        echo "RAG Response:"
+        echo "$ANSWER"
+        echo ""
+        echo "RAG search is working."
+      else
+        echo "WARNING: RAG test returned no answer (model may still be loading)."
+        echo "         Ingestion was successful — try querying manually."
+      fi
+    fi
   fi
   echo ""
 fi
