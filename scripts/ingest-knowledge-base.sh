@@ -42,8 +42,12 @@ if [ ! -d "$KB_DIR" ]; then
   exit 1
 fi
 
-MD_COUNT=$(ls -1 "${KB_DIR}"/*.md 2>/dev/null | wc -l | tr -d ' ')
-if [ "$MD_COUNT" -eq 0 ]; then
+MD_FILES=()
+for f in "${KB_DIR}"/*.md; do
+  [ -f "$f" ] && MD_FILES+=("$f")
+done
+
+if [ ${#MD_FILES[@]} -eq 0 ]; then
   echo "ERROR: No .md files found in ${KB_DIR}"
   exit 1
 fi
@@ -52,7 +56,42 @@ echo "=============================================="
 echo "  Llama Stack - Knowledge Base Ingestion"
 echo "=============================================="
 echo ""
-echo "Found ${MD_COUNT} markdown file(s) in ${KB_DIR}"
+echo "Available files in ${KB_DIR}:"
+echo ""
+for i in "${!MD_FILES[@]}"; do
+  FNAME=$(basename "${MD_FILES[$i]}")
+  FSIZE=$(wc -c < "${MD_FILES[$i]}" | tr -d ' ')
+  echo "  $((i + 1))) ${FNAME}  (${FSIZE} bytes)"
+done
+echo ""
+echo "Enter file numbers to ingest (comma-separated), or 'all' for everything."
+echo "Example: 1,3 or all"
+read -p "Files to ingest [all]: " FILE_SELECTION
+FILE_SELECTION="${FILE_SELECTION:-all}"
+
+SELECTED_FILES=()
+if [ "$FILE_SELECTION" == "all" ]; then
+  SELECTED_FILES=("${MD_FILES[@]}")
+else
+  IFS=',' read -ra INDICES <<< "$FILE_SELECTION"
+  for idx in "${INDICES[@]}"; do
+    idx=$(echo "$idx" | tr -d ' ')
+    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt ${#MD_FILES[@]} ]; then
+      echo "ERROR: Invalid selection '${idx}'. Must be 1-${#MD_FILES[@]}."
+      exit 1
+    fi
+    SELECTED_FILES+=("${MD_FILES[$((idx - 1))]}")
+  done
+fi
+
+if [ ${#SELECTED_FILES[@]} -eq 0 ]; then
+  echo "ERROR: No files selected."
+  exit 1
+fi
+
+MD_COUNT=${#SELECTED_FILES[@]}
+echo ""
+echo "Selected ${MD_COUNT} file(s) for ingestion."
 echo ""
 
 # =============================================================================
@@ -325,8 +364,7 @@ FILE_COUNT=0
 SUCCESS_COUNT=0
 FAIL_COUNT=0
 
-for FILE_PATH in "${KB_DIR}"/*.md; do
-  [ -f "$FILE_PATH" ] || continue
+for FILE_PATH in "${SELECTED_FILES[@]}"; do
 
   FILENAME=$(basename "$FILE_PATH")
   FILE_COUNT=$((FILE_COUNT + 1))
