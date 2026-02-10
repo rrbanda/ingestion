@@ -210,9 +210,10 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "  TEST 7: RAG Query (file_search via Responses API)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-# Pick a model - prefer gemini, then any
+# Pick a model - prefer scout, then gemini, then any
 if [ -n "$LLM_MODELS" ]; then
-  TEST_MODEL=$(echo "$LLM_MODELS" | grep -m1 'gemini-2.5-flash$' 2>/dev/null || \
+  TEST_MODEL=$(echo "$LLM_MODELS" | grep -m1 'scout' 2>/dev/null || \
+               echo "$LLM_MODELS" | grep -m1 'gemini-2.5-flash$' 2>/dev/null || \
                echo "$LLM_MODELS" | grep -m1 'gemini' 2>/dev/null || \
                echo "$LLM_MODELS" | head -1)
 else
@@ -242,10 +243,15 @@ else
   if [ $CURL_RC -ne 0 ]; then
     fail "RAG query request failed (curl error)"
   else
-    # Check for API error
-    API_ERROR=$(echo "$RAG_RESPONSE" | jq -r '.detail // .error // empty' 2>/dev/null)
+    # Check for API error (multiple formats: .detail, .error, .error.message)
+    API_ERROR=$(echo "$RAG_RESPONSE" | jq -r '
+      if .detail then .detail
+      elif .error and (.error | type) == "object" then .error.message // .error.type // "unknown error"
+      elif .error and (.error | type) == "string" then .error
+      else empty end' 2>/dev/null)
     if [ -n "$API_ERROR" ] && [ "$API_ERROR" != "null" ]; then
       fail "RAG query returned error: ${API_ERROR}"
+      echo "  Hint: Try a different model. Some models do not support Responses API with file_search."
     else
       # Check for file_search_call in output (tool was actually executed)
       HAS_TOOL_CALL=$(echo "$RAG_RESPONSE" | jq -r '.output[]? | select(.type == "file_search_call") | .type' 2>/dev/null)
